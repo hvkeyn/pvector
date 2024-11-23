@@ -1,28 +1,116 @@
 import asyncio
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+from typing import Optional, List
 from playwright.async_api import async_playwright
-from typing import Optional
-from concurrent.futures import ThreadPoolExecutor
+import aiohttp
+import random
+import time
 
 
-# Модель данных для запросов
-class CrawlRequest(BaseModel):
-    url: str
-    proxy: Optional[str] = None  # Прокси (необязательно)
-    user_agent: Optional[str] = None  # Пользовательский User-Agent (необязательно)
+# ========== Прокси менеджер ==========
+class ProxyManager:
+    def __init__(self):
+        self.proxies = []
+
+    def add_proxy(self, proxy: str):
+        """Добавить прокси"""
+        if proxy not in self.proxies:
+            self.proxies.append(proxy)
+
+    def remove_proxy(self, proxy: str):
+        """Удалить прокси"""
+        if proxy in self.proxies:
+            self.proxies.remove(proxy)
+
+    def list_proxies(self):
+        """Вывести список прокси"""
+        return self.proxies
+
+    async def check_proxy(self, proxy: str):
+        """Проверить статус прокси"""
+        try:
+            start_time = time.time()
+            async with aiohttp.ClientSession() as session:
+                async with session.get("https://ipinfo.io/json", proxy=f"http://{proxy}", timeout=5) as response:
+                    elapsed_time = time.time() - start_time
+                    if response.status == 200:
+                        data = await response.json()
+                        return {
+                            "proxy": proxy,
+                            "status": "working",
+                            "location": data.get("city", "unknown") + ", " + data.get("country", "unknown"),
+                            "latency": round(elapsed_time, 2),
+                        }
+                    else:
+                        return {"proxy": proxy, "status": "failed"}
+        except Exception as e:
+            return {"proxy": proxy, "status": "failed", "error": str(e)}
+
+    def get_working_proxy(self):
+        """Выбрать случайный рабочий прокси из списка"""
+        if not self.proxies:
+            raise HTTPException(status_code=400, detail="No proxies available")
+        return random.choice(self.proxies)
 
 
-# Создаем FastAPI приложение
+proxy_manager = ProxyManager()
+
+# ========== FastAPI приложение ==========
 app = FastAPI()
 
 
-# Функция для загрузки страницы
+# Модель для запросов
+class ProxyRequest(BaseModel):
+    proxy: str
+
+
+class CrawlRequest(BaseModel):
+    url: str
+    use_internal_proxy: Optional[bool] = False  # Использовать внутренний прокси
+    proxy: Optional[str] = None  # Внешний прокси
+    user_agent: Optional[str] = None  # Пользовательский User-Agent (необязательно)
+
+
+# ========== Эндпоинты менеджера прокси ==========
+@app.post("/proxy/add")
+def add_proxy(request: ProxyRequest):
+    proxy_manager.add_proxy(request.proxy)
+    return {"message": "Proxy added successfully", "proxy": request.proxy}
+
+
+@app.delete("/proxy/remove")
+def remove_proxy(request: ProxyRequest):
+    proxy_manager.remove_proxy(request.proxy)
+    return {"message": "Proxy removed successfully", "proxy": request.proxy}
+
+
+@app.get("/proxy/list")
+def list_proxies():
+    proxies = proxy_manager.list_proxies()
+    return {"proxies": proxies}
+
+
+@app.get("/proxy/check")
+async def check_proxy(proxy: str):
+    status = await proxy_manager.check_proxy(proxy)
+    return status
+
+
+@app.get("/proxy/check/all")
+async def check_all_proxies():
+    proxies = proxy_manager.list_proxies()
+    tasks = [proxy_manager.check_proxy(proxy) for proxy in proxies]
+    results = await asyncio.gather(*tasks)
+    return {"proxies_status": results}
+
+
+# ========== Эндпоинты для парсинга ==========
 async def fetch_page(url: str, proxy: Optional[str] = None, user_agent: Optional[str] = None):
     async with async_playwright() as p:
         browser_args = {"headless": True}
         if proxy:
-            browser_args["proxy"] = {"server": proxy}
+            browser_args["proxy"] = {"server": f"http://{proxy}"}
 
         browser = await p.chromium.launch(**browser_args)
         context_args = {}
@@ -44,41 +132,19 @@ async def fetch_page(url: str, proxy: Optional[str] = None, user_agent: Optional
             await browser.close()
             raise HTTPException(status_code=500, detail=f"Error fetching page: {str(e)}")
 
-# Асинхронный эндпоинт для выполнения задачи
+
 @app.post("/crawl")
 async def crawl_page(request: CrawlRequest):
-    content = await fetch_page(request.url, request.proxy, request.user_agent)
-    return {"url": request.url, "content": content}
+    # Определяем, какой прокси использовать
+    proxy = request.proxy
+    if request.use_internal_proxy and not proxy:
+        try:
+            proxy = proxy_manager.get_working_proxy()
+        except HTTPException:
+            proxy = None  # Продолжаем без прокси, если нет рабочих
 
-
-# Устанавливаем ограничение на потоки для многозадачности
-executor = ThreadPoolExecutor(max_workers=10)  # Настройка максимального числа потоков
-
-
-# Асинхронный обработчик для запуска задач параллельно
-@app.post("/crawl/multiple")
-async def crawl_multiple(requests: list[CrawlRequest]):
-    loop = asyncio.get_event_loop()
-
-    # Запускаем задачи в потоках
-    tasks = [
-        loop.run_in_executor(
-            executor,
-            lambda req=req: asyncio.run(fetch_page(req.url, req.proxy, req.user_agent))
-        )
-        for req in requests
-    ]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-
-    # Формируем ответы
-    responses = []
-    for i, result in enumerate(results):
-        if isinstance(result, Exception):
-            responses.append({"url": requests[i].url, "error": str(result)})
-        else:
-            responses.append({"url": requests[i].url, "content": result})
-    return responses
-
+    content = await fetch_page(request.url, proxy, request.user_agent)
+    return {"url": request.url, "proxy_used": proxy, "content": content}
 
 # Запуск сервера (если запускается как отдельный скрипт)
 if __name__ == "__main__":
