@@ -1,7 +1,7 @@
 import asyncio
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 from playwright.async_api import async_playwright
 import aiohttp
 import random
@@ -9,9 +9,11 @@ import time
 import logging
 import os
 
+# Настройка логирования
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# ========== Прокси менеджер ==========
 class ProxyManager:
     def __init__(self):
         self.proxies = []
@@ -51,6 +53,7 @@ class ProxyManager:
 proxy_manager = ProxyManager()
 app = FastAPI()
 
+# Модель для запросов
 class ProxyRequest(BaseModel):
     proxy: str
 
@@ -59,6 +62,11 @@ class CrawlRequest(BaseModel):
     use_internal_proxy: Optional[bool] = False
     proxy: Optional[str] = None
     user_agent: Optional[str] = None
+
+class PostRequest(CrawlRequest):
+    post_data: Optional[Dict[str, Any]] = None  # Параметры для POST-запроса
+    headers: Optional[Dict[str, str]] = None    # Дополнительные заголовки
+    cookies: Optional[Dict[str, str]] = None    # Cookies для запроса
 
 @app.get("/routes")
 def list_routes():
@@ -103,46 +111,62 @@ async def check_all_proxies():
     except asyncio.TimeoutError:
         return {"message": "Proxy checking timed out"}
 
-async def fetch_page(url: str, proxy: Optional[str] = None, user_agent: Optional[str] = None):
+async def fetch_page(url: str, proxy: Optional[str] = None, user_agent: Optional[str] = None, headers: Optional[Dict[str, str]] = None, cookies: Optional[Dict[str, str]] = None, post_data: Optional[Dict[str, Any]] = None):
     async with async_playwright() as p:
         browser_args = {"headless": True}
         if proxy:
             browser_args["proxy"] = {"server": f"http://{proxy}"}
         browser = await p.chromium.launch(**browser_args)
-        context = await browser.new_context(user_agent=user_agent)
+        context = await browser.new_context(user_agent=user_agent, extra_http_headers=headers)
+        if cookies:
+            for name, value in cookies.items():
+                await context.add_cookies([{"name": name, "value": value, "url": url}])
         page = await context.new_page()
         try:
-            await page.goto(url, timeout=6000)
-            content = await page.content()
-            await browser.close()
-            return content
+            if post_data:
+                await page.goto(url, timeout=6000)
+                response = await page.evaluate(
+                    """(url, data) => fetch(url, {
+                        method: 'POST',
+                        body: JSON.stringify(data),
+                        headers: { 'Content-Type': 'application/json' }
+                    }).then(res => res.text())""",
+                    url,
+                    post_data,
+                )
+                await browser.close()
+                return {"content": response, "headers": await page.evaluate("() => document.head.innerHTML"), "cookies": cookies}
+            else:
+                await page.goto(url, timeout=6000)
+                content = await page.content()
+                headers = await page.evaluate("() => document.head.innerHTML")
+                await browser.close()
+                return {"content": content, "headers": headers, "cookies": cookies}
         except Exception as e:
             await browser.close()
             raise HTTPException(status_code=500, detail=f"Failed to fetch page {url}: {str(e)}")
 
 @app.post("/crawl")
 async def crawl_page(request: CrawlRequest):
-    if not request.url:
-        raise HTTPException(status_code=400, detail="URL is required")
     proxy = request.proxy or (proxy_manager.get_working_proxy() if request.use_internal_proxy else None)
     content = await fetch_page(request.url, proxy, request.user_agent)
     return {"url": request.url, "proxy_used": proxy, "content": content}
 
-@app.post("/crawl/multiple")
-async def crawl_multiple(requests: List[CrawlRequest]):
-    results = []
-    for req in requests:
-        try:
-            proxy = req.proxy or (proxy_manager.get_working_proxy() if req.use_internal_proxy else None)
-            content = await fetch_page(req.url, proxy, req.user_agent)
-            results.append({"url": req.url, "proxy_used": proxy, "content": content})
-        except Exception as e:
-            results.append({"url": req.url, "error": str(e)})
-    return results
+@app.post("/post_crawl")
+async def post_crawl(request: PostRequest):
+    proxy = request.proxy or (proxy_manager.get_working_proxy() if request.use_internal_proxy else None)
+    result = await fetch_page(
+        url=request.url,
+        proxy=proxy,
+        user_agent=request.user_agent,
+        headers=request.headers,
+        cookies=request.cookies,
+        post_data=request.post_data,
+    )
+    return {"url": request.url, "proxy_used": proxy, "result": result}
 
 if __name__ == "__main__":
     import uvicorn
-
     host = os.getenv("SERVER_HOST", "0.0.0.0")
     port = int(os.getenv("SERVER_PORT", 8000))
     uvicorn.run(app, host=host, port=port)
