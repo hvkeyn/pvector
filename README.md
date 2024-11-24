@@ -24,8 +24,8 @@ UPVector Server is a universal web crawler and proxy manager implemented using F
 ### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/<your-username>/<your-repo>.git
-cd <your-repo>
+git clone https://github.com/hvkeyn/upvector.git
+cd upvector
 ```
 
 ### 2. Install Dependencies
