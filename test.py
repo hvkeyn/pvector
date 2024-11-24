@@ -1,7 +1,7 @@
 import requests
 
 # Базовый URL API
-API_URL = "http://localhost:8000"
+API_URL = "http://0.0.0.0:8000"
 CRAWL_URL = f"{API_URL}/crawl"
 MULTIPLE_CRAWL_URL = f"{API_URL}/crawl/multiple"
 PROXY_URL = f"{API_URL}/proxy"
@@ -30,7 +30,7 @@ def test_single_request():
 def test_multiple_requests():
     # Данные для нескольких запросов
     payload = [
-        {"url": "https://ya.ru"},
+        {"url": "https://anycoindirect.eu"},
         {"url": "https://httpbin.org/get", "proxy": None},
         {"url": "https://jsonplaceholder.typicode.com/posts"}
     ]
@@ -95,7 +95,40 @@ def test_internal_proxy_crawl():
         print(f"Ошибка: {response.status_code}")
         print(response.text)
 
+def test_connection():
+    api_url = f"{API_URL}/test_connection"
+
+    try:
+        response = requests.get(api_url)
+        if response.status_code == 200:
+            print("Успешное соединение!")
+            print("Ответ сервера:", response.json())
+        else:
+            print(f"Ошибка: {response.status_code}")
+            print(response.text)
+    except Exception as e:
+        print(f"Не удалось подключиться: {str(e)}")
+
+def modules_list():
+    api_url = f"{API_URL}/routes"
+
+    try:
+        response = requests.get(api_url)
+        if response.status_code == 200:
+            print("Ответ сервера:", response.json())
+        else:
+            print(f"Ошибка: {response.status_code}")
+            print(response.text)
+    except Exception as e:
+        print(f"Не удалось подключиться: {str(e)}")
+
 if __name__ == "__main__":
+    print("=== Тест Соединения ===")
+    test_connection()
+
+    print("=== Список модулей на сервере ===")
+    modules_list()
+
     print("=== Тест одиночного запроса ===")
     test_single_request()
 

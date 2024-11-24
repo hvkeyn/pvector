@@ -1,34 +1,35 @@
 import asyncio
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 from typing import Optional, List
 from playwright.async_api import async_playwright
 import aiohttp
 import random
 import time
+import logging
+import os
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# ========== Прокси менеджер ==========
 class ProxyManager:
     def __init__(self):
         self.proxies = []
 
     def add_proxy(self, proxy: str):
-        """Добавить прокси"""
         if proxy not in self.proxies:
             self.proxies.append(proxy)
+            logger.info(f"Proxy added: {proxy}")
 
     def remove_proxy(self, proxy: str):
-        """Удалить прокси"""
         if proxy in self.proxies:
             self.proxies.remove(proxy)
+            logger.info(f"Proxy removed: {proxy}")
 
     def list_proxies(self):
-        """Вывести список прокси"""
         return self.proxies
 
     async def check_proxy(self, proxy: str):
-        """Проверить статус прокси"""
         try:
             start_time = time.time()
             async with aiohttp.ClientSession() as session:
@@ -36,118 +37,112 @@ class ProxyManager:
                     elapsed_time = time.time() - start_time
                     if response.status == 200:
                         data = await response.json()
-                        return {
-                            "proxy": proxy,
-                            "status": "working",
-                            "location": data.get("city", "unknown") + ", " + data.get("country", "unknown"),
-                            "latency": round(elapsed_time, 2),
-                        }
-                    else:
-                        return {"proxy": proxy, "status": "failed"}
+                        return {"proxy": proxy, "status": "working", "location": f"{data.get('city', 'unknown')}, {data.get('country', 'unknown')}", "latency": round(elapsed_time, 2)}
         except Exception as e:
+            logger.warning(f"Proxy check failed for {proxy}: {str(e)}")
             return {"proxy": proxy, "status": "failed", "error": str(e)}
 
     def get_working_proxy(self):
-        """Выбрать случайный рабочий прокси из списка"""
         if not self.proxies:
             raise HTTPException(status_code=400, detail="No proxies available")
         return random.choice(self.proxies)
 
 
 proxy_manager = ProxyManager()
-
-# ========== FastAPI приложение ==========
 app = FastAPI()
 
-
-# Модель для запросов
 class ProxyRequest(BaseModel):
     proxy: str
 
-
 class CrawlRequest(BaseModel):
     url: str
-    use_internal_proxy: Optional[bool] = False  # Использовать внутренний прокси
-    proxy: Optional[str] = None  # Внешний прокси
-    user_agent: Optional[str] = None  # Пользовательский User-Agent (необязательно)
+    use_internal_proxy: Optional[bool] = False
+    proxy: Optional[str] = None
+    user_agent: Optional[str] = None
 
+@app.get("/routes")
+def list_routes():
+    return [{"path": route.path, "methods": list(route.methods)} for route in app.routes]
 
-# ========== Эндпоинты менеджера прокси ==========
+@app.get("/test_connection")
+def test_connection(request: Request):
+    client_host = request.client.host
+    return {"status": "ok", "message": "Connection successful!", "client_ip": client_host, "server_ip": request.headers.get("host", "unknown")}
+
 @app.post("/proxy/add")
 def add_proxy(request: ProxyRequest):
     proxy_manager.add_proxy(request.proxy)
     return {"message": "Proxy added successfully", "proxy": request.proxy}
-
 
 @app.delete("/proxy/remove")
 def remove_proxy(request: ProxyRequest):
     proxy_manager.remove_proxy(request.proxy)
     return {"message": "Proxy removed successfully", "proxy": request.proxy}
 
-
 @app.get("/proxy/list")
 def list_proxies():
     proxies = proxy_manager.list_proxies()
+    if not proxies:
+        return {"message": "No proxies available"}
     return {"proxies": proxies}
-
 
 @app.get("/proxy/check")
 async def check_proxy(proxy: str):
     status = await proxy_manager.check_proxy(proxy)
     return status
 
-
 @app.get("/proxy/check/all")
 async def check_all_proxies():
     proxies = proxy_manager.list_proxies()
+    if not proxies:
+        return {"message": "No proxies available"}
     tasks = [proxy_manager.check_proxy(proxy) for proxy in proxies]
-    results = await asyncio.gather(*tasks)
-    return {"proxies_status": results}
+    try:
+        results = await asyncio.wait_for(asyncio.gather(*tasks), timeout=30)
+        return {"proxies_status": results}
+    except asyncio.TimeoutError:
+        return {"message": "Proxy checking timed out"}
 
-
-# ========== Эндпоинты для парсинга ==========
 async def fetch_page(url: str, proxy: Optional[str] = None, user_agent: Optional[str] = None):
     async with async_playwright() as p:
         browser_args = {"headless": True}
         if proxy:
             browser_args["proxy"] = {"server": f"http://{proxy}"}
-
         browser = await p.chromium.launch(**browser_args)
-        context_args = {}
-
-        # Установка кастомного User-Agent (если указан)
-        if user_agent:
-            context_args["user_agent"] = user_agent
-
-        context = await browser.new_context(**context_args)
+        context = await browser.new_context(user_agent=user_agent)
         page = await context.new_page()
-
         try:
-            # Загрузка страницы
-            await page.goto(url, timeout=60000)
+            await page.goto(url, timeout=6000)
             content = await page.content()
             await browser.close()
             return content
         except Exception as e:
             await browser.close()
-            raise HTTPException(status_code=500, detail=f"Error fetching page: {str(e)}")
-
+            raise HTTPException(status_code=500, detail=f"Failed to fetch page {url}: {str(e)}")
 
 @app.post("/crawl")
 async def crawl_page(request: CrawlRequest):
-    # Определяем, какой прокси использовать
-    proxy = request.proxy
-    if request.use_internal_proxy and not proxy:
-        try:
-            proxy = proxy_manager.get_working_proxy()
-        except HTTPException:
-            proxy = None  # Продолжаем без прокси, если нет рабочих
-
+    if not request.url:
+        raise HTTPException(status_code=400, detail="URL is required")
+    proxy = request.proxy or (proxy_manager.get_working_proxy() if request.use_internal_proxy else None)
     content = await fetch_page(request.url, proxy, request.user_agent)
     return {"url": request.url, "proxy_used": proxy, "content": content}
 
-# Запуск сервера (если запускается как отдельный скрипт)
+@app.post("/crawl/multiple")
+async def crawl_multiple(requests: List[CrawlRequest]):
+    results = []
+    for req in requests:
+        try:
+            proxy = req.proxy or (proxy_manager.get_working_proxy() if req.use_internal_proxy else None)
+            content = await fetch_page(req.url, proxy, req.user_agent)
+            results.append({"url": req.url, "proxy_used": proxy, "content": content})
+        except Exception as e:
+            results.append({"url": req.url, "error": str(e)})
+    return results
+
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    host = os.getenv("SERVER_HOST", "0.0.0.0")
+    port = int(os.getenv("SERVER_PORT", 8000))
+    uvicorn.run(app, host=host, port=port)
